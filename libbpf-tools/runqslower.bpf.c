@@ -92,10 +92,94 @@ int handle__sched_switch(u64 *ctx)
 	bpf_probe_read_str(&event.task, sizeof(event.task), next->comm);
 
 	/* output */
-	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,
-			      &event, sizeof(event));
+	//bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,
+	//		      &event, sizeof(event));
 
 	bpf_map_delete_elem(&start, &pid);
+	return 0;
+}
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 128); /* size should be >= number of CPUs */
+	__type(key, u32);
+	__type(value, struct exec_event);
+} execs SEC(".maps");
+
+static const struct exec_event empty_event = {};
+const volatile size_t max_args = 20;
+
+SEC("tp/syscalls/sys_enter_execve")
+int handle__execve_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	u64 id = bpf_get_current_pid_tgid();
+	u32 pid = (u32)id, tgid = id >> 32;
+	size_t i, len;
+	void **argv, *arg, *strs;
+	struct exec_event *e;
+
+	if (bpf_map_update_elem(&execs, &pid, &empty_event, BPF_NOEXIST))
+		return 0; /* should never happen */
+
+	e = bpf_map_lookup_elem(&execs, &pid);
+	if (!e)
+		return 0; /* shouldn't happen */
+
+	len = bpf_probe_read_str(e->strs, MAX_ARG_LEN, (void *)ctx->args[0]);
+	if (len > MAX_ARG_LEN) /* failed to read filename, pretend it's empty */
+		len = 0;
+
+	e->pid = pid;
+	e->tgid = tgid;
+	e->fname_len = len;
+	bpf_get_current_comm(e->comm, sizeof(e->comm));
+
+	argv = (void **)ctx->args[1];
+	strs = e->strs + len;
+
+	#pragma unroll
+	for (i = 0; i < MAX_ARG_CNT && i < max_args; i++) {
+		bpf_probe_read(&arg, sizeof(arg), &argv[i]);
+		if (!arg) /* no more arguments */
+			break;
+
+		len = bpf_probe_read_str(strs, MAX_ARG_LEN, arg);
+		if (len > MAX_ARG_LEN) /* failed to read argument, leave it empty */
+			len = 0;
+
+		strs += len;
+		e->arg_cnt++;
+		e->arg_lens[i] = len;
+	}
+	if (i == MAX_ARG_CNT) /* there might be more arguments */
+		e->arg_cnt = -e->arg_cnt;
+	/* ret is reused as temporary total event size field */
+	e->ret = strs - (void *)e;
+	return 0;
+
+cleanup:
+	bpf_map_delete_elem(&execs, &pid);
+	return 0;
+}
+
+SEC("tp/syscalls/sys_exit_execve")
+int handle__execve_exit(struct trace_event_raw_sys_exit* ctx)
+{
+	u32 pid = (u32)bpf_get_current_pid_tgid();
+	struct exec_event *e;
+	size_t len;
+
+	e = bpf_map_lookup_elem(&execs, &pid);
+	if (!e) /* missed sys_enter */
+		return 0;
+
+	len = e->ret; /* restore total actual event size */
+	e->ret = ctx->ret; /* now store real return result */
+
+	if (len < sizeof(*e)) /* should always be the case */
+		bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, e, len);
+
+	bpf_map_delete_elem(&execs, &pid);
 	return 0;
 }
 

@@ -109,17 +109,38 @@ static int bump_memlock_rlimit(void)
 	return setrlimit(RLIMIT_MEMLOCK, &rlim_new);
 }
 
+static const char *get_str(const char *strs, size_t off, size_t len)
+{
+	if (len == 0)
+		return "<unknown>";
+	return strs + off;
+}
+
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz)
 {
-	const struct event *e = data;
+	const struct exec_event *e = data;
 	struct tm *tm;
 	char ts[32];
 	time_t t;
+	int i, off, cnt;
 
 	time(&t);
 	tm = localtime(&t);
 	strftime(ts, sizeof(ts), "%H:%M:%S", tm);
-	printf("%-8s %-16s %-6d %14llu\n", ts, e->task, e->pid, e->delta_us);
+
+	cnt = e->arg_cnt < 0 ? -e->arg_cnt : e->arg_cnt;
+	printf("[%d/%d] %s (ret=%d), filename %s, %d%s args",
+	       e->tgid, e->pid, e->comm, e->ret,
+	       get_str(e->strs, 0, e->fname_len),
+	       cnt, e->arg_cnt < 0 ? "+" : "");
+
+	off = e->fname_len;
+	for (i = 0; i < cnt; ++i) {
+		printf("%c%s", (i == 0 ? ':' : ','),
+		       get_str(e->strs, off, e->arg_lens[i]));
+		off += e->arg_lens[i];
+	}
+	printf("\n");
 }
 
 void handle_lost_events(void *ctx, int cpu, __u64 lost_cnt)
@@ -157,10 +178,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* initialize global data (filtering options) */
-	obj->rodata->targ_tgid = env.pid;
-	obj->rodata->targ_pid = env.tid;
-	obj->rodata->min_us = env.min_us;
+	obj->rodata->max_args = 30;
 
 	err = runqslower_bpf__load(obj);
 	if (err) {
